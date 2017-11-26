@@ -3,7 +3,7 @@ TOPDIR ?= ${CURDIR}
 include config.mk
 
 RTE_TARGET ?= x86_64-native-linuxapp-gcc
-RTE_SDK = $(shell ls -d $(TOPDIR)/3rd/dpdk-*)
+RTE_SDK = $(TOPDIR)/3rd/dpdk
 ifeq ($(shell test -e $(RTE_SDK)/$(RTE_TARGET) || echo -n no),no)
 $(error please build DPDK first. build command: 'make -C $(RTE_SDK) install T=$(RTE_TARGET)')
 endif
@@ -32,7 +32,7 @@ INSTALL=install
 # PROJECT_ROOT:=$(abspath .)
 HIMONGO_STATICLIB:=3rd/himongo/libhimongo.a
 URCU_STATIC_LIBS:=3rd/liburcu/src/.libs/liburcu-cds.a 3rd/liburcu/src/.libs/liburcu.a
-YAML_STATICLIB:=3rd/libyaml/src/.libs/libyaml.a
+LUAJIT_STATICLIB:=3rd/luajit/src/libluajit.a
 
 SHUKE_SRC_DIR:=src
 # Default settings
@@ -47,18 +47,21 @@ INC_DIR_LIST=$(SHUKE_SRC_DIR) \
 				     3rd     \
 						 3rd/liburcu/include \
 						 3rd/liburcu/src   \
-             3rd/libyaml/include
+             3rd/luajit/src
 				     # $(RTE_SDK)/$(RTE_TARGET)/include
-SRC_LIST := admin.c ae.c anet.c conf.c dict.c dpdk_module.c dpdk_kni.c \
-						ds.c debug.c edns.c mongo.c protocol.c rbtree.c rculfhash-mm-socket.c \
-						sds.c shuke.c str.c utils.c zone_parser.c zmalloc.c tcpserver.c
+SRC_LIST := admin.c ae.c anet.c conf.c dict.c dpdk_module.c \
+            dpdk_kni.c dnspacket.c debug.c edns.c mongo.c \
+            rbtree.c rculfhash-mm-socket.c sds.c shuke.c \
+            str.c utils.c zparser.c zmalloc.c tcpserver.c \
+            ltree.c toml.c zone.c \
+            sk_lua_util.c sk_lua_log.c
 SHUKE_SRC := $(foreach v, $(SRC_LIST), $(SHUKE_SRC_DIR)/$(v))
 SHUKE_OBJ := $(patsubst %.c,$(SHUKE_BUILD_DIR)/%.o,$(SRC_LIST))
 
 
 FINAL_CFLAGS=$(STD) $(WARN) $(OPT) $(DEBUG_FLAGS) $(CFLAGS) $(SHUKE_CFLAGS) $(MACROS)
 FINAL_LDFLAGS=$(LDFLAGS) $(SHUKE_LDFLAGS) $(DEBUG_FLAGS)
-FINAL_LIBS=$(HIMONGO_STATICLIB) $(URCU_STATIC_LIBS) $(YAML_STATICLIB) -pthread -lrt
+FINAL_LIBS=$(HIMONGO_STATICLIB) $(URCU_STATIC_LIBS) $(LUAJIT_STATICLIB) -pthread -lrt
 
 # FINAL_CFLAGS += -include $(RTE_SDK)/$(RTE_TARGET)/include/rte_config.h -msse4.2
 FINAL_CFLAGS += $(addprefix -I,$(INC_DIR_LIST))
@@ -132,7 +135,6 @@ clean:
 distclean: clean
 	-(make -C 3rd/himongo clean)
 	-(make -C 3rd/liburcu clean)
-	-(make -C 3rd/libyaml clean)
 
 .PHONY: distclean
 
@@ -141,7 +143,7 @@ $(SHUKE_BUILD_DIR):
 
 @PHONY: $(SHUKE_BUILD_DIR)
 
-3rd: $(HIMONGO_STATICLIB) $(URCU_STATIC_LIBS) $(YAML_STATICLIB)
+3rd: $(HIMONGO_STATICLIB) $(URCU_STATIC_LIBS) $(LUAJIT_STATICLIB)
 
 update3rd:
 	rm -rf 3rd/himongo 3rd/liburcu && git submodule update --init
@@ -161,14 +163,11 @@ $(URCU_STATIC_LIBS): 3rd/liburcu/Makefile
 3rd/liburcu/bootstrap:
 	git submodule update --init
 
-$(YAML_STATICLIB): 3rd/libyaml/Makefile
-	cd 3rd/libyaml && make
-
-3rd/libyaml/Makefile: | 3rd/libyaml/bootstrap
-	cd 3rd/libyaml && ./bootstrap && ./configure
-
-3rd/libyaml/bootstrap:
+3rd/luajit/Makefile:
 	git submodule update --init
+
+$(LUAJIT_STATICLIB): 3rd/luajit/Makefile
+	make -C 3rd/luajit
 
 install: all
 	@mkdir -p $(INSTALL_BIN)

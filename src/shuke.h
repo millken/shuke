@@ -23,8 +23,12 @@
 #include "endianconv.h"
 #include "list.h"
 #include "log.h"
-#include "ds.h"
+#include "dnspacket.h"
+#include "ltree.h"
 #include "dpdk_module.h"
+#include "zparser.h"
+#include "zone.h"
+#include "sk_lua.h"
 
 #include "himongo/async.h"
 
@@ -64,7 +68,7 @@ typedef struct numaNode_s {
     int *lcore_ids;
     int min_lcore_id;
     int max_lcore_id;
-    zoneDict *zd;
+    ltree *lt;
 } numaNode_t;
 
 typedef struct _tcpServer {
@@ -141,10 +145,8 @@ struct shuke {
     // config
     char *configfile;
 
-    char *coremask;
     int master_lcore_id;
-    char *mem_channels;
-    int portmask;
+    int mem_channels;
     bool promiscuous_on;
     bool numa_on;
     bool jumbo_on;
@@ -182,7 +184,10 @@ struct shuke {
     int admin_port;
 
     int all_reload_interval;
+    int max_resp_size;
     bool minimize_resp;
+
+    char *access_by_lua_src;
     // end config
 
     /*
@@ -210,7 +215,7 @@ struct shuke {
     // end
 
     // pointer to master numa node's zoneDict instance
-    zoneDict *zd;
+    ltree *lt;
     struct rb_root rbroot;
 
     volatile bool force_quit;
@@ -344,6 +349,6 @@ void _shukePanic(char *msg, char *file, int line);
  *     config
  *---------------------------------------------*/
 sds configToStr();
-void initConfigFromYamlFile(char *conffile);
+void initConfigFromTomlFile(char *conffile);
 
 #endif /* _SHUKE_H_ */

@@ -9,7 +9,7 @@
 
 #include "utils.h"
 #include "version.h"
-#include "ds.h"
+#include "dnspacket.h"
 #include "zmalloc.h"
 #include "edns.h"
 
@@ -61,9 +61,9 @@ zone *getOldestZone() {
  * @param origin: must be absolute domain name in len label format.
  */
 void masterRefreshZone(char *origin) {
-    zoneDictRLock(sk.zd);
-    zone *z = zoneDictFetchVal(sk.zd, origin);
-    zoneDictRUnlock(sk.zd);
+    ltreeRLock(sk.lt);
+    zone *z = ltreeGetZoneExactRaw(sk.lt, origin);
+    ltreeRUnlock(sk.lt);
 
     if (z == NULL) return;
     assert(RB_EMPTY_NODE(&z->rbnode));
@@ -116,27 +116,21 @@ void zoneUpdateRoundRabinInfo(zone *z) {
  * @return
  */
 int replaceZoneAllNumaNodes(zone *z) {
-    zoneDict *zd = sk.zd;
+    int err = 0;
     z->refresh_ts = sk.unixtime + z->refresh;
     zoneUpdateRoundRabinInfo(z);
 
     replaceZoneOtherNuma(z);
 
-    int err = 1;
-    zone *old_z;
-    struct cds_lfht *ht = zd->ht;
-    struct cds_lfht_node *ht_node;
-    unsigned int hash = zoneDictHash(z->origin, z->originLen);
-    zoneDictWLock(zd);
-    ht_node = cds_lfht_add_replace(ht, hash, zoneDictHtMatch, z->origin,
-                                   &z->htnode);
-    if (ht_node) {
-        old_z = caa_container_of(ht_node, zone, htnode);
+    ltreeWLock(sk.lt);
+    zone *old_z = ltreeGetZoneExactRaw(sk.lt, z->origin);
+    if (old_z != NULL) {
         rbtreeDeleteZone(old_z);
-        call_rcu(&old_z->rcu_head, zoneDictFreeCallback);
         err = 0;
     }
-    zoneDictWUnlock(zd);
+    ltreeReplaceNoLock(sk.lt, z);
+    ltreeWUnlock(sk.lt);
+
     rbtreeInsertZone(z);
     return err;
 }
@@ -147,7 +141,7 @@ int addZoneAllNumaNodes(zone *z) {
 
     addZoneOtherNuma(z);
 
-    int err = zoneDictAdd(sk.zd, z);
+    int err = ltreeAdd(sk.lt, z);
     assert(err == DICT_OK);
     rbtreeInsertZone(z);
     return err;
@@ -159,29 +153,18 @@ int addZoneAllNumaNodes(zone *z) {
  */
 int deleteZoneAllNumaNodes(char *origin) {
     int err = 0;
-    zoneDict *zd = sk.zd;
 
     // delete the zone on non-master numa node
     deleteZoneOtherNuma(origin);
 
-    struct cds_lfht *ht = zd->ht;	/* Hash table */
-    int ret = 0;
-    struct cds_lfht_iter iter;	/* For iteration on hash table */
-    struct cds_lfht_node *ht_node;
-    unsigned int hash = zoneDictHash(origin, strlen(origin));
-
-    zoneDictWLock(zd);
-    cds_lfht_lookup(ht, hash, zoneDictHtMatch, origin, &iter);
-    ht_node = cds_lfht_iter_get_node(&iter);
-    if (ht_node) {
-        ret = cds_lfht_del(ht, ht_node);
-        if (ret == 0) {
-            zone *del_z = caa_container_of(ht_node, zone, htnode);
-            rbtreeDeleteZone(del_z);
-            call_rcu(&del_z->rcu_head, zoneDictFreeCallback);
-        }
+    ltreeWLock(sk.lt);
+    zone *del_z = ltreeGetZoneExactRaw(sk.lt, origin);
+    if (del_z != NULL) {
+        rbtreeDeleteZone(del_z);
     }
-    zoneDictWUnlock(zd);
+    ltreeDeleteNoLock(sk.lt, origin);
+
+    ltreeWUnlock(sk.lt);
     return err;
 }
 
@@ -228,8 +211,8 @@ zoneReloadContext *zoneReloadContextCreate(char *dotOrigin) {
     char origin[MAX_DOMAIN_LEN+2];
     dot2lenlabel(dotOrigin, origin);
 
-    zoneDictRLock(sk.zd);
-    old_zn = zoneDictFetchVal(sk.zd, origin);
+    ltreeRLock(sk.lt);
+    old_zn = ltreeGetZoneExactRaw(sk.lt, origin);
 
     if (old_zn != NULL) {
         /*
@@ -259,7 +242,7 @@ zoneReloadContext *zoneReloadContextCreate(char *dotOrigin) {
     t->zone_exist = zone_exist;
     t->status = TASK_PENDING;
 invalid:
-    zoneDictRUnlock(sk.zd);
+    ltreeRUnlock(sk.lt);
     return t;
 }
 
@@ -318,7 +301,7 @@ void deleteZoneOtherNuma(char *origin) {
         int numa_id = sk.numa_ids[i];
         numaNode_t *node = sk.nodes[numa_id];
         if (numa_id == sk.master_numa_id) continue;
-        zoneDictDelete(node->zd, origin);
+        ltreeDelete(node->lt, origin);
     }
 }
 
@@ -330,7 +313,7 @@ void replaceZoneOtherNuma(zone *z) {
         zone *new_z = zoneCopy(z, numa_id);
         zoneUpdateRoundRabinInfo(new_z);
 
-        zoneDictReplace(node->zd, new_z);
+        ltreeReplace(node->lt, new_z);
     }
 }
 
@@ -343,7 +326,7 @@ void addZoneOtherNuma(zone *z) {
         zone *new_z = zoneCopy(z, numa_id);
         zoneUpdateRoundRabinInfo(new_z);
 
-        err = zoneDictAdd(node->zd, new_z);
+        err = ltreeAdd(node->lt, new_z);
         assert(err == DICT_OK);
     }
 }
@@ -567,111 +550,6 @@ void logQuery(struct context *ctx, char *cip, int cport, bool is_tcp) {
     fprintf(sk.query_log_fp, "%s queries: client %s#%d%s: query %s IN %s \n", buf, cip, cport, tcpstr, dotName, ty_str);
 }
 
-int dumpDnsResp(struct context *ctx, dnsDictValue *dv, zone *z) {
-    if (dv == NULL) return ERR_CODE;
-    // current start position in response buffer.
-    int errcode;
-    numaNode_t *node = ctx->node;
-
-    compressInfo temp = {ctx->name, DNS_HDR_SIZE, ctx->nameLen+1};
-    ctx->cps[0] = temp;
-    ctx->cps_sz = 1;
-    ctx->ari_sz = 0;
-
-    RRSet *cname;
-    dnsHeader_t hdr = {ctx->hdr.xid, 0, 1, 0, 0, ctx->hdr.nArRR};
-
-    SET_QR_R(hdr.flag);
-    SET_AA(hdr.flag);
-    if (GET_RD(ctx->hdr.flag)) SET_RD(hdr.flag);
-
-    cname = dnsDictValueGet(dv, DNS_TYPE_CNAME);
-    if (cname) {
-        hdr.nAnRR = 1;
-        errcode = RRSetCompressPack(ctx, cname, DNS_HDR_SIZE);
-        if (errcode == ERR_CODE) {
-            return ERR_CODE;
-        }
-        // dump NS records of the zone this CNAME record's value belongs to to authority section
-        if (!sk.minimize_resp) {
-            char *name = ctx->ari[0].name;
-            size_t offset = ctx->ari[0].offset;
-            LOG_DEBUG(USER1, "name: %s, offset: %d", name, offset);
-            zone *ns_z = zoneDictGetZone(node->zd, name);
-            if (ns_z) {
-                if (ns_z->ns) {
-                    hdr.nNsRR += ns_z->ns->num;
-                    size_t nameOffset = offset + strlen(name) - strlen(ns_z->origin);
-                    errcode = RRSetCompressPack(ctx, ns_z->ns, nameOffset);
-                    if (errcode == ERR_CODE) {
-                        return ERR_CODE;
-                    }
-                }
-            }
-        }
-    } else {
-        // dump answer section.
-        RRSet *rs = dnsDictValueGet(dv, ctx->qType);
-        if (rs) {
-            hdr.nAnRR = rs->num;
-            errcode = RRSetCompressPack(ctx, rs, DNS_HDR_SIZE);
-            if (errcode == ERR_CODE) {
-                return ERR_CODE;
-            }
-        }
-        if (!sk.minimize_resp) {
-            // dump NS section
-            if (z->ns && (ctx->qType != DNS_TYPE_NS || strcasecmp(z->origin, ctx->name) != 0)) {
-                hdr.nNsRR += z->ns->num;
-                size_t nameOffset = DNS_HDR_SIZE + ctx->nameLen - strlen(z->origin);
-                errcode = RRSetCompressPack(ctx, z->ns, nameOffset);
-                if (errcode == ERR_CODE) {
-                    return ERR_CODE;
-                }
-            }
-        }
-    }
-    // MX, NS, SRV records cause additional section processing.
-    //TODO avoid duplication
-    for (size_t i = 0; i < ctx->ari_sz; i++) {
-        zone *ar_z;
-        char *name = ctx->ari[i].name;
-        size_t offset = ctx->ari[i].offset;
-
-        // TODO avoid fetch when the name belongs to z
-        ar_z = zoneDictGetZone(node->zd, name);
-        if (ar_z == NULL) continue;
-        RRSet *ar_a = zoneFetchTypeVal(ar_z, name, DNS_TYPE_A);
-        if (ar_a) {
-            hdr.nArRR += ar_a->num;
-            errcode = RRSetCompressPack(ctx, ar_a, offset);
-            if (errcode == ERR_CODE) {
-                return ERR_CODE;
-            }
-        }
-        RRSet *ar_aaaa = zoneFetchTypeVal(ar_z, name, DNS_TYPE_AAAA);
-        if (ar_aaaa) {
-            hdr.nArRR += ar_aaaa->num;
-            errcode = RRSetCompressPack(ctx, ar_aaaa, offset);
-            if (errcode == ERR_CODE) {
-                return ERR_CODE;
-            }
-        }
-    }
-    // dump edns
-    if (ctx->hdr.nArRR == 1) {
-        int edns_len = ctx->edns.rdlength + 11;
-        if (unlikely(contextMakeRoomForResp(ctx, edns_len) == ERR_CODE)) {
-            return ERR_CODE;
-        }
-        ednsDump(ctx->chunk+ctx->cur, ctx->chunk_len-ctx->cur, &ctx->edns);
-        ctx->cur += edns_len;
-    }
-    // update the header. don't update `cur` in ctx
-    dnsHeader_dump(&hdr, ctx->chunk, DNS_HDR_SIZE);
-    return OK_CODE;
-}
-
 int dumpDnsError(struct context *ctx, int err) {
     dnsHeader_t hdr = {ctx->hdr.xid, 0, 1, 0, 0, ctx->hdr.nArRR};
 
@@ -711,66 +589,31 @@ static inline int dumpDnsRefusedErr(struct context *ctx) {
 
 static int _getDnsResponse(char *buf, size_t sz, struct context *ctx)
 {
+    struct dname dn;
     numaNode_t *node = ctx->node;
     zone *z = NULL;
     dnsDictValue *dv = NULL;
     // int64_t now;
-    char *name;
-    int ret;
-
-    if (sz < 12) {
-        LOG_DEBUG(USER1, "receive bad dns query message with only %d bytes, drop it", sz);
-        // just ignore this packet(don't send response)
-        return ERR_CODE;
-    }
-    dnsHeader_load(buf, sz, &(ctx->hdr));
-    ret = parseDnsQuestion(buf+DNS_HDR_SIZE, sz-DNS_HDR_SIZE, &(ctx->name), &(ctx->qType), &(ctx->qClass));
-    if (ret == PROTO_ERR) {
-        LOG_DEBUG(USER1, "parse dns question error.");
-        return ERR_CODE;
-    }
-    // skip dns header and dns question.
-    ctx->cur = DNS_HDR_SIZE + ret;
-
-    LOG_DEBUG(USER1, "receive dns query message(xid: %d, qd: %d, an: %d, ns: %d, ar:%d)",
-              ctx->hdr.xid, ctx->hdr.nQd, ctx->hdr.nAnRR, ctx->hdr.nNsRR, ctx->hdr.nArRR);
-    // in order to support EDNS, nArRR can bigger than 0
-    if (ctx->hdr.nQd != 1 || ctx->hdr.nAnRR > 0 || ctx->hdr.nNsRR > 0 || ctx->hdr.nArRR > 1) {
-        LOG_DEBUG(USER1, "receive bad dns query message(xid: %d, qd: %d, an: %d, ns: %d, ar: %d), drop it",
-                  ctx->hdr.xid, ctx->hdr.nQd, ctx->hdr.nAnRR, ctx->hdr.nNsRR, ctx->hdr.nArRR);
-        dumpDnsFormatErr(ctx);
-        ret = OK_CODE;
-        goto end;
+    int ret = OK_CODE;
+    decodeRcode res = decodeQuery(buf, sz, ctx);
+    switch (res) {
+        case DECODE_IGNORE:
+            return ERR_CODE;
+        case DECODE_FORMERR:
+            dumpDnsFormatErr(ctx);
+            return OK_CODE;
+        case DECODE_NOTIMP:
+            dumpDnsNotImplErr(ctx);
+            return OK_CODE;
+        case DECODE_BADVERS:
+            break;
+        default:
+            break;
     }
 
-    ctx->nameLen = lenlabellen(ctx->name);
-
-    if (isSupportDnsType(ctx->qType) == false) {
-        dumpDnsNotImplErr(ctx);
-        ret = OK_CODE;
-        goto end;
-    }
-    if (ctx->hdr.nArRR == 1) {
-        // parse OPT message(EDNS)
-        if (ednsParse(buf+ctx->cur, sz-ctx->cur, &(ctx->edns)) == ERR_CODE) {
-            ret = ERR_CODE;
-            goto end;
-        }
-        LOG_DEBUG(USER1, "ENDS: payload: %d, version: %d, rdlength: %d",
-                  ctx->edns.payload_size, ctx->edns.version, ctx->edns.rdlength);
-    }
-    LOG_DEBUG(USER1, "dns question: %s, %d", ctx->name, ctx->qType);
-
-    name = ctx->name;
-
-    if (ctx->qType == DNS_TYPE_SRV) {
-        // ignore SRV service
-        name += (*name +1);
-        // ignore SRV proto
-        name += (*name +1);
-    }
-    zoneDictRLock(node->zd);
-    z = zoneDictGetZone(node->zd, name);
+    ltreeRLock(node->lt);
+    makeDname(ctx->name, &dn);
+    z = ltreeGetZone(node->lt, &dn);
     ctx->z = z;
 
     if (z == NULL) {
@@ -789,8 +632,7 @@ static int _getDnsResponse(char *buf, size_t sz, struct context *ctx)
             }
         }
     }
-    zoneDictRUnlock(node->zd);
-end:
+    ltreeRUnlock(node->lt);
     return ret;
 }
 
@@ -846,6 +688,7 @@ int processTCPDnsQuery(tcpConn *conn, char *buf, size_t sz)
     ctx.chunk_len = respLen;
     ctx.cur = 0;
     ctx.resp_type = RESP_STACK;
+    ctx.edns.payload_size = (uint16_t )sk.max_resp_size;
 
     status = _getDnsResponse(buf, sz, &ctx);
 
@@ -1022,38 +865,38 @@ static void initShuke() {
         sk.asyncReloadAllZone = &getAllZoneFromFile;
         sk.asyncReloadZone = &reloadZoneFromFile;
     } else {
-        LOG_FATAL(USER1, "invalid data store config %s", sk.data_store);
+        LOG_EXIT(USER1, "invalid data store config %s", sk.data_store);
     }
 
     sk.rbroot = RB_ROOT;
     // create zoneDict for all numa nodes
     for (int i = 0; i < sk.nr_numa_id; ++i) {
         int numa_id = sk.numa_ids[i];
-        sk.nodes[numa_id]->zd = zoneDictCreate(numa_id);
+        sk.nodes[numa_id]->lt = ltreeCreate(numa_id);
     }
-    assert(master_node->zd);
-    sk.zd = master_node->zd;
+    assert(master_node->lt);
+    sk.lt = master_node->lt;
 
     long long reload_all_start = mstime();
     if (sk.syncGetAllZone() == ERR_CODE) {
-        LOG_FATAL(USER1, "can't load all zone data from %s", sk.data_store);
+        LOG_EXIT(USER1, "can't load all zone data from %s", sk.data_store);
     }
     sk.zone_load_time = mstime() - reload_all_start;
     LOG_INFO(USER1, "loading all zone from %s to memory cost %lld milliseconds.", sk.data_store, sk.zone_load_time);
     sk.last_all_reload_ts = sk.unixtime;
 
     if (sk.initAsyncContext() == ERR_CODE) {
-        LOG_FATAL(USER1, "init %s async context error.", sk.data_store);
+        LOG_EXIT(USER1, "init %s async context error.", sk.data_store);
     }
     // process task queue
     if (aeCreateTimeEvent(sk.el, TIME_INTERVAL, mainThreadCron, NULL, NULL) == AE_ERR) {
-        LOG_FATAL(USER1, "Can't create time event proc");
+        LOG_EXIT(USER1, "Can't create time event proc");
     }
 
     // run admin server
     LOG_INFO(USER1, "starting admin server on %s:%d", sk.admin_host, sk.admin_port);
     if (initAdminServer() == ERR_CODE) {
-        LOG_FATAL(USER1, "can't init admin server.");
+        LOG_EXIT(USER1, "can't init admin server.");
     }
 }
 
@@ -1073,11 +916,6 @@ static int construct_lcore_list() {
 
     sk.total_lcore_list = strdup(buffer);
     return OK_CODE;
-}
-
-static int hexchar_to_int(char c) {
-    char buf[2] = {c, 0};
-    return (int)strtol(buf, NULL, 16);
 }
 
 static int parseQueueConfigNumList(char *errstr, char *s, int arr[], int *nrEle) {
@@ -1207,19 +1045,19 @@ int parseQueueConfig(char *errstr, char *s) {
                 snprintf(errstr, ERR_STR_LEN, "portid should in 0-%d, but gives %d.", RTE_MAX_ETHPORTS, port_id);
                 goto invalid;
             }
-            port_info_t *pinfo = sk.port_info[port_id];
-            if (!pinfo) {
-                snprintf(errstr, ERR_STR_LEN, "queue config: port %d is disabled.", port_id);
-                goto invalid;
+            if (! sk.port_info[port_id]) {
+                sk.port_info[port_id] = calloc(1, sizeof(port_info_t));
             }
+
+            port_info_t *pinfo = sk.port_info[port_id];
             if (pinfo->lcore_list) {
                 snprintf(errstr, ERR_STR_LEN, "duplicate queue config for port %d.", port_id);
                 goto invalid;
             }
             pinfo->lcore_list = memdup(cores, sizeof(int)*nrCores);
             pinfo->nr_lcore = nrCores;
-            for (int j = 0; j < nrCores; ++j) {
-                int lcore_id = cores[j];
+            for (int k = 0; k < nrCores; ++k) {
+                int lcore_id = cores[k];
                 if (lcore_id < 0 || lcore_id >= RTE_MAX_LCORE) {
                     snprintf(errstr, ERR_STR_LEN, "lcore should in 0-%d, but gives %d.", RTE_MAX_LCORE, lcore_id);
                     goto invalid;
@@ -1229,11 +1067,7 @@ int parseQueueConfig(char *errstr, char *s) {
                     goto invalid;
                 }
                 lcore_conf_t *qconf = &sk.lcore_conf[lcore_id];
-                if (qconf->lcore_id >= RTE_MAX_LCORE) {
-                    snprintf(errstr, ERR_STR_LEN, "queue config: lcore %d is not enabled.", lcore_id);
-                    goto invalid;
-                }
-                qconf->queue_id_list[port_id] = j;
+                qconf->queue_id_list[port_id] = k;
 
                 qconf->port_id_list[qconf->nr_ports] = port_id;
                 qconf->nr_ports++;
@@ -1246,41 +1080,6 @@ int parseQueueConfig(char *errstr, char *s) {
 invalid:
     free(ss);
     return ERR_CODE;
-}
-
-static int parse_str_coremask(char *coremask, int buf[], int *n) {
-    int max = *n;
-    int nr_id = 0;
-    // skip '0' and 'x'
-    char *start = coremask + 2;
-    char *end = coremask + strlen(coremask) - 1;
-    char *p = end;
-    for (; p >= start; --p) {
-        int char_int = hexchar_to_int(*p);
-        for (int i = 0; i < 4; ++i) {
-            if ((1 << i) & char_int) {
-                int lcore_id = (int)(4 * (end - p) + i);
-                if (nr_id >= max) return ERR_CODE;
-                buf[nr_id++] = lcore_id;
-            }
-        }
-    }
-    *n = nr_id;
-    return OK_CODE;
-}
-
-static int get_port_ids(int buf[], int *n) {
-    int max = *n;
-    int nr_id = 0;
-    int num_bits = sizeof(sk.portmask) * 8;
-    for (int i = 0; i < num_bits; ++i) {
-        if (sk.portmask & (1 << i)) {
-            if (nr_id >= max) return ERR_CODE;
-            buf[nr_id++] = i;
-        }
-    }
-    *n = nr_id;
-    return OK_CODE;
 }
 
 int initNumaConfig() {
@@ -1346,48 +1145,45 @@ int initNumaConfig() {
     return 0;
 }
 
+static int merge_int_list(int *l1, int sz1, int *l2, int sz2) {
+    int n = sz1;
+    bool found;
+    for (int i = 0; i < sz2; i++) {
+        int v = l2[i];
+        found = false;
+        for (int j = 0; j < n; j++) {
+            if (l1[j] == v) {
+                found = true;
+                break;
+            }
+        }
+        if (found == false) l1[n++] = v;
+    }
+    return n;
+}
+
 int initOtherConfig() {
     int ids[1024];
     int nr_id;
 
-    // parse coremask
-    nr_id = 1024;
-    if (parse_str_coremask(sk.coremask, ids, &nr_id) == ERR_CODE) {
-        fprintf(stderr, "error: the number of locre is bigger than %d.\n", nr_id);
-        abort();
-    }
-    sk.lcore_ids = memdup(ids, nr_id * sizeof(int));
-    sk.nr_lcore_ids = nr_id;
-    /*
-     * if master_lcore_id is not set, then use the last lcore id in coremask
-     */
-    if (sk.master_lcore_id < 0) {
-        sk.master_lcore_id = sk.lcore_ids[sk.nr_lcore_ids-1];
-    } else {
-        /*
-         * make sure master lcore id stay in lcore list
-         */
-        int found = 0;
-        for (int i = 0; i < sk.nr_lcore_ids; ++i) {
-            if (sk.lcore_ids[i] == sk.master_lcore_id) {
-                found = 1;
-                break;
-            }
-        }
-        if (! found) {
-            fprintf(stderr, "error: master lcore id(%d) is not enabled in coremask.\n", sk.master_lcore_id);
-            exit(-1);
-        }
+    // parse queue config
+    if (parseQueueConfig(sk.errstr, sk.queue_config) != OK_CODE) {
+        fprintf(stderr, "queue config: %s\n", sk.errstr);
+        exit(-1);
     }
 
-    // parse all port id
-    nr_id = 1024;
-    if (get_port_ids(ids, &nr_id) == ERR_CODE) {
-        fprintf(stderr, "error: the number of port is bigger than %d.\n", nr_id);
-        abort();
+    /*
+     * collect port id list from port info
+     */
+    nr_id = 0;
+    for (int portid = 0; portid < RTE_MAX_ETHPORTS; portid++) {
+        port_info_t *pinfo = sk.port_info[portid];
+        if (! pinfo) continue;
+        ids[nr_id++] = portid;
     }
-    sk.port_ids = memdup(ids, nr_id * sizeof(int));
+    sortIntArray(ids, nr_id);
     sk.nr_ports = nr_id;
+    sk.port_ids = memdup(ids, nr_id*sizeof(int));
 
     if (sk.bindaddr_count != sk.nr_ports) {
         fprintf(stderr, "the number of ip address should equal to number of ports.\n");
@@ -1396,8 +1192,6 @@ int initOtherConfig() {
 
     for (int i = 0; i < sk.nr_ports; ++i) {
         int portid = sk.port_ids[i];
-        assert(sk.port_info[portid] == NULL);
-        sk.port_info[portid] = calloc(1, sizeof(port_info_t));
         assert(sk.port_info[portid]);
         sk.port_info[portid]->port_id = (uint8_t)portid;
         if (!str2ipv4(sk.bindaddr[i], &sk.port_info[portid]->ipv4_addr)) {
@@ -1405,6 +1199,21 @@ int initOtherConfig() {
             exit(-1);
         }
     }
+
+    /*
+     * collect lcore id list from port info
+     */
+    nr_id = 0;
+    ids[nr_id++] = sk.master_lcore_id;
+    for (int i = 0; i < sk.nr_ports; i++) {
+        int portid = sk.port_ids[i];
+        port_info_t *pinfo = sk.port_info[portid];
+        if (! pinfo->lcore_list) continue;
+        nr_id = merge_int_list(ids, nr_id, pinfo->lcore_list, pinfo->nr_lcore);
+    }
+    sortIntArray(ids, nr_id);
+    sk.nr_lcore_ids = nr_id;
+    sk.lcore_ids = memdup(ids, nr_id*sizeof(int));
 
     if (construct_lcore_list() == ERR_CODE) {
         fprintf(stderr, "error: lcore list is too long\n");
@@ -1417,12 +1226,6 @@ int initOtherConfig() {
     init_dpdk_eal();
 
     initNumaConfig();
-
-    // parse queue config
-    if (parseQueueConfig(sk.errstr, sk.queue_config) != OK_CODE) {
-        fprintf(stderr, "queue config: %s\n", sk.errstr);
-        exit(-1);
-    }
 
     return OK_CODE;
 }
@@ -1453,7 +1256,7 @@ int main(int argc, char *argv[]) {
 #endif
 
     getConfigFname(argc, argv);
-    initConfigFromYamlFile(sk.configfile);
+    initConfigFromTomlFile(sk.configfile);
     if (sk.daemonize) daemonize();
     // configure log as early as possible
     config_log();
@@ -1484,7 +1287,7 @@ int main(int argc, char *argv[]) {
             if (is_all_veth_up()) break;
             else {
                 if (i == 20) {
-                    LOG_FATAL(USER1, "can't bring all kni virtual interfaces up.");
+                    LOG_EXIT(USER1, "can't bring all kni virtual interfaces up.");
                 }
             }
         }
