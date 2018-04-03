@@ -144,6 +144,7 @@ struct shuke {
 
     // config
     char *configfile;
+    char *prefix;
 
     int master_lcore_id;
     int mem_channels;
@@ -187,7 +188,7 @@ struct shuke {
     int max_resp_size;
     bool minimize_resp;
 
-    char *access_by_lua_src;
+    struct lua_conf lconf;
     // end config
 
     /*
@@ -286,8 +287,9 @@ struct shuke {
  *     Extern declarations
  *---------------------------------------------*/
 extern struct shuke sk;
-extern dictType commandTableDictType;
-extern dictType zoneFileDictType;
+extern dictType dictTypeCaseStringCopyKey;
+extern dictType dictTypeCaseStringCopyKeyVal;
+extern dictType dictTypeStringCopyKey;
 
 int snpack(char *buf, int offset, size_t size, char const *fmt, ...);
 /*----------------------------------------------
@@ -322,8 +324,9 @@ int mongoGetAllZone(void);
 int mongoAsyncReloadZone(zoneReloadContext *t);
 int mongoAsyncReloadAllZone(void);
 
-int processUDPDnsQuery(struct rte_mbuf *m, char *udp_data, size_t udp_data_len, char *src_addr, uint16_t src_port,
-                       bool is_ipv4, numaNode_t *node, int lcore_id);
+int processUDPDnsQuery(struct rte_mbuf *m, char *udp_data, size_t udp_data_len,
+                       char *src_addr, uint16_t src_port,
+                       bool is_ipv4, lcore_conf_t *qconf);
 
 int processTCPDnsQuery(tcpConn *conn, char *buf, size_t sz);
 

@@ -79,7 +79,7 @@ static int addZoneFileToConf(char *k, char *v) {
 
 static int _parse_toml_config(FILE *fp) {
     toml_table_t *conf;
-    toml_table_t *dpdk, *core, *zone_source;
+    toml_table_t *dpdk, *core, *zone_source, *lua;
     char errbuf[200];
     conf = toml_parse_file(fp, errbuf, sizeof(errbuf));
     if (conf == NULL) {
@@ -187,7 +187,7 @@ static int _parse_toml_config(FILE *fp) {
             fprintf(stderr, "Config Error: zone_files_root must be an absolute path.\n");
             exit(1);
         }
-        sk.zone_files_dict = dictCreate(&zoneFileDictType, NULL, SOCKET_ID_HEAP);
+        sk.zone_files_dict = dictCreate(&dictTypeCaseStringCopyKeyVal, NULL, SOCKET_ID_HEAP);
         for (int i = 0; ; i++) {
             if ((entry = toml_table_at(file_list, i)) == NULL) break;
             char *k=NULL, *v=NULL;
@@ -220,6 +220,11 @@ static int _parse_toml_config(FILE *fp) {
         exit(EXIT_FAILURE);
     }
 
+    if ((lua = toml_table_in(conf, "lua")) != NULL) {
+        GET_STR_CONFIG("package_path", sk.lconf.package_path, lua);
+        GET_STR_CONFIG("package_cpath", sk.lconf.package_cpath, lua);
+        GET_STR_CONFIG("access_by_lua", sk.lconf.access_by_lua_src, lua);
+    }
     return 0;
 }
 

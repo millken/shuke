@@ -16,6 +16,7 @@
 #include "shuke.h"
 #include "asciilogo.h"
 
+DEF_LOG_MODULE(RTE_LOGTYPE_USER1, "SHUKE");
 
 struct shuke sk;
 
@@ -195,6 +196,7 @@ static zoneReloadContext* __shiftZoneReloadContext() {
 }
 
 /*!
+ *
  * create a zone reload Context
  *
  * @param dotOrigin : the origin in <label dot> format
@@ -376,7 +378,7 @@ void config_log() {
 }
 
 static void printAsciiLogo() {
-    LOG_RAW(INFO, USER1, "SHUKE %s\n\n%s\n", SHUKE_VERSION, shuke_ascii_logo);
+    LOG_RAW(INFO, "SHUKE %s\n\n%s\n", SHUKE_VERSION, shuke_ascii_logo);
 }
 
 void createPidFile(void) {
@@ -408,6 +410,7 @@ static void daemonize(void) {
 
 static void usage() {
     printf("-c /path/to/shuke.conf    configure file.\n"
+           "-p prefix                 set prefix path(current work directory).\n"
            "-h                        print this help and exit. \n"
            "-v                        print version. \n");
 }
@@ -430,7 +433,7 @@ static void sigShutdownHandler(int sig) {
             msg = "Received shutdown signal, scheduling shutdown...";
     };
 
-    LOG_WARN(USER1, msg);
+    LOG_WARN(msg);
     sk.force_quit = true;
     aeStop(sk.el);
     if (sk.daemonize)
@@ -455,7 +458,6 @@ void setupSignalHandlers(void) {
     sigaction(SIGBUS, &act, NULL);
     sigaction(SIGFPE, &act, NULL);
     sigaction(SIGILL, &act, NULL);
-    return;
 }
 
 /*----------------------------------------------
@@ -480,7 +482,7 @@ static int _getAllZoneFromFile(bool is_first) {
             return ERR_CODE;
         } else {
             if (strcasecmp(z->dotOrigin, dotOrigin) != 0) {
-                LOG_ERROR(USER1, "the origin(%s) of zone in file %s is not %s", z->dotOrigin, fname, dotOrigin);
+                LOG_ERROR("the origin(%s) of zone in file %s is not %s", z->dotOrigin, fname, dotOrigin);
                 zoneDestroy(z);
                 return ERR_CODE;
             }
@@ -513,7 +515,7 @@ int reloadZoneFromFile(zoneReloadContext *t) {
             return ERR_CODE;
         } else {
             if (strcasecmp(z->dotOrigin, t->dotOrigin) != 0) {
-                LOG_ERROR(USER1, "the origin(%s) of zone in file %s is not %s", z->dotOrigin, fname, t->dotOrigin);
+                LOG_ERROR("the origin(%s) of zone in file %s is not %s", z->dotOrigin, fname, t->dotOrigin);
                 zoneDestroy(z);
                 return ERR_CODE;
             }
@@ -590,6 +592,16 @@ static int _getDnsResponse(char *buf, size_t sz, struct context *ctx)
             break;
     }
 
+    if (sk.lconf.access_by_lua_src) {
+        lcore_conf_t *qconf = &sk.lcore_conf[rte_lcore_id()];
+        if (luaL_loadstring(qconf->L, sk.lconf.access_by_lua_src)) {
+            LOG_ERR("can't load string %s", lua_tostring(qconf->L, -1));
+        }
+        if (lua_pcall (qconf->L, 0, 0, 0)){
+            LOG_ERR("can't  pcall %s", lua_tostring(qconf->L, -1));
+        }
+    }
+
     ltreeRLock(node->lt);
     makeDname(ctx->name, &dn);
     z = ltreeGetZone(node->lt, &dn);
@@ -597,7 +609,7 @@ static int _getDnsResponse(char *buf, size_t sz, struct context *ctx)
 
     if (z == NULL) {
         // zone is not managed by this server
-        LOG_DEBUG(USER1, "zone is NULL, name: %s", ctx->name);
+        LOG_DEBUG("zone is NULL, name: %s", ctx->name);
         dumpDnsRefusedErr(ctx);
         ret = OK_CODE;
     } else {
@@ -617,20 +629,20 @@ static int _getDnsResponse(char *buf, size_t sz, struct context *ctx)
 
 int processUDPDnsQuery(struct rte_mbuf *m, char *udp_data, size_t udp_data_len,
                        char *src_addr, uint16_t src_port,
-                       bool is_ipv4, numaNode_t *node, int lcore_id)
+                       bool is_ipv4, lcore_conf_t *qconf)
 {
     int udp_data_offset = (int)(udp_data - rte_pktmbuf_mtod(m, char*));
-    struct context ctx;
-    ctx.node = node;
-    ctx.lcore_id = lcore_id;
-    ctx.chunk = udp_data;
-    ctx.chunk_len = rte_pktmbuf_tailroom(m);
-    ctx.cur = 0;
-    ctx.resp_type = RESP_MBUF;
-    ctx.m = m;
-    ctx.max_resp_size = 512;
+    struct context *ctx = &qconf->ctx;
+    ctx->node = qconf->node;
+    ctx->lcore_id = qconf->lcore_id;
+    ctx->chunk = udp_data;
+    ctx->chunk_len = rte_pktmbuf_tailroom(m);
+    ctx->cur = 0;
+    ctx->resp_type = RESP_MBUF;
+    ctx->m = m;
+    ctx->max_resp_size = 512;
     int status;
-    status = _getDnsResponse(udp_data, udp_data_len, &ctx);
+    status = _getDnsResponse(udp_data, udp_data_len, ctx);
 
     if (status != ERR_CODE && sk.query_log_fp) {
         char cip[IP_STR_LEN];
@@ -638,13 +650,13 @@ int processUDPDnsQuery(struct rte_mbuf *m, char *udp_data, size_t udp_data_len,
         int af = is_ipv4? AF_INET:AF_INET6;
         inet_ntop(af, (void*)src_addr,cip,IP_STR_LEN);
         cport = ntohs(src_port);
-        logQuery(&ctx, cip, cport, false);
+        logQuery(ctx, cip, cport, false);
     }
     struct rte_mbuf *last_m = rte_pktmbuf_lastseg(m);
-    last_m->data_len += (uint16_t )ctx.cur;
-    m->pkt_len += ctx.cur;
+    last_m->data_len += (uint16_t )ctx->cur;
+    m->pkt_len += ctx->cur;
 
-    unsigned max_pkt_len = (unsigned)(ctx.max_resp_size + udp_data_offset);
+    unsigned max_pkt_len = (unsigned)(ctx->max_resp_size + udp_data_offset);
     if (m->pkt_len > max_pkt_len) {
         // set TC flag
         *((uint8_t*)(udp_data+2)) |= (uint8_t )0x02;
@@ -656,33 +668,35 @@ int processUDPDnsQuery(struct rte_mbuf *m, char *udp_data, size_t udp_data_len,
 
 int processTCPDnsQuery(tcpConn *conn, char *buf, size_t sz)
 {
+    lcore_conf_t *qconf = &sk.lcore_conf[rte_lcore_id()];
     int status;
     char resp[4096];
     size_t respLen = 4096;
 
-    struct context ctx;
-    ctx.node = sk.nodes[sk.master_numa_id];
-    ctx.lcore_id = sk.master_lcore_id;
-    ctx.chunk = resp;
-    ctx.chunk_len = respLen;
-    ctx.cur = 0;
-    ctx.resp_type = RESP_STACK;
-    ctx.max_resp_size = (uint16_t )sk.max_resp_size;
+    struct context *ctx = &qconf->ctx;
+    ctx->node = qconf->node;
+    ctx->lcore_id = qconf->lcore_id;
+    ctx->chunk = resp;
+    ctx->chunk_len = respLen;
+    ctx->cur = 0;
+    ctx->resp_type = RESP_STACK;
+    ctx->max_resp_size = (uint16_t )sk.max_resp_size;
 
-    status = _getDnsResponse(buf, sz, &ctx);
+    status = _getDnsResponse(buf, sz, ctx);
 
     if (status != ERR_CODE && sk.query_log_fp) {
-        logQuery(&ctx, conn->cip, conn->cport, true);
+        logQuery(ctx, conn->cip, conn->cport, true);
     }
 
-    snpack(ctx.chunk, DNS_HDR_SIZE, respLen, "m>hh", ctx.name, ctx.nameLen+1, ctx.qType, ctx.qClass);
-    if (ctx.cur > ctx.max_resp_size) {
+    snpack(ctx->chunk, DNS_HDR_SIZE, respLen, "m>hh",
+           ctx->name, ctx->nameLen+1, ctx->qType, ctx->qClass);
+    if (ctx->cur > ctx->max_resp_size) {
         // set TC flag
-        *((uint8_t*)(ctx.chunk+2)) |= (uint8_t )0x02;
-        ctx.cur = ctx.max_resp_size;
+        *((uint8_t*)(ctx->chunk+2)) |= (uint8_t )0x02;
+        ctx->cur = ctx->max_resp_size;
     }
-    tcpConnAppendDnsResponse(conn, ctx.chunk, ctx.cur);
-    if(ctx.resp_type == RESP_HEAP) zfree(ctx.chunk);
+    tcpConnAppendDnsResponse(conn, ctx->chunk, ctx->cur);
+    if(ctx->resp_type == RESP_HEAP) zfree(ctx->chunk);
     return status;
 }
 
@@ -708,7 +722,7 @@ static int mainThreadCron(struct aeEventLoop *el, long long id, void *clientData
         }
         // check if need to do all reload
         if (sk.unixtime - sk.last_all_reload_ts > sk.all_reload_interval) {
-            LOG_INFO(USER1, "start reloading all zone asynchronously.");
+            LOG_INFO("start reloading all zone asynchronously.");
             sk.asyncReloadAllZone();
         }
         while ((ctx = __shiftZoneReloadContext()) != NULL) {
@@ -726,10 +740,10 @@ static int mainThreadCron(struct aeEventLoop *el, long long id, void *clientData
 /*----------------------------------------------
  *     dict type definition
  *---------------------------------------------*/
-// static unsigned int _dictStringHash(const void *key)
-// {
-//     return dictGenHashFunction(key, strlen(key));
-// }
+static unsigned int _dictStringHash(const void *key)
+{
+    return dictGenHashFunction(key, strlen(key));
+}
 
 static unsigned int _dictStringCaseHash(const void *key)
 {
@@ -748,12 +762,12 @@ static void _dictStringDestructor(void *privdata, void *key)
     socket_free(d->socket_id, key);
 }
 
-// static int _dictStringKeyCompare(void *privdata, const void *key1,
-//                                  const void *key2)
-// {
-//     DICT_NOTUSED(privdata);
-//     return strcmp(key1, key2) == 0;
-// }
+static int _dictStringKeyCompare(void *privdata, const void *key1,
+                                 const void *key2)
+{
+    DICT_NOTUSED(privdata);
+    return strcmp(key1, key2) == 0;
+}
 
 static int _dictStringKeyCaseCompare(void *privdata, const void *key1,
                                      const void *key2)
@@ -763,7 +777,7 @@ static int _dictStringKeyCaseCompare(void *privdata, const void *key1,
 }
 
 /* ----------------------- zone file Hash Table Type ------------------------*/
-dictType zoneFileDictType = {
+dictType dictTypeCaseStringCopyKeyVal = {
         _dictStringCaseHash,         /* hash function */
         _dictStringDup,              /* key dup */
         _dictStringDup,              /* val dup */
@@ -771,12 +785,22 @@ dictType zoneFileDictType = {
         _dictStringDestructor,       /* key destructor */
         _dictStringDestructor,       /* val destructor */
 };
+
 /* ----------------------- command Hash Table Type ------------------------*/
-dictType commandTableDictType = {
+dictType dictTypeCaseStringCopyKey = {
         _dictStringCaseHash,          /* hash function */
-        NULL,                         /* key dup */
+        _dictStringDup,               /* key dup */
         NULL,                         /* val dup */
         _dictStringKeyCaseCompare,    /* key compare */
+        _dictStringDestructor,        /* key destructor */
+        NULL,                         /* val destructor */
+};
+
+dictType dictTypeStringCopyKey = {
+        _dictStringHash,              /* hash function */
+        _dictStringDup,               /* key dup */
+        NULL,                         /* val dup */
+        _dictStringKeyCompare,        /* key compare */
         _dictStringDestructor,        /* key destructor */
         NULL,                         /* val destructor */
 };
@@ -784,15 +808,20 @@ dictType commandTableDictType = {
 static char *getConfigFname(int argc, char **argv) {
     int c;
     char *conffile = NULL;
+    char *prefix = NULL;
     char cwd[MAXLINE];
     if (getcwd(cwd, MAXLINE) == NULL) {
         fprintf(stderr, "getcwd: %s.\n", strerror(errno));
         exit(1);
     }
+
     while ((c = getopt(argc, argv, "c:hv")) != -1) {
         switch (c) {
             case 'c':
                 conffile = optarg;
+                break;
+            case 'p':
+                prefix = toAbsPath(optarg, cwd);
                 break;
             case 'h':
                 usage();
@@ -810,6 +839,10 @@ static char *getConfigFname(int argc, char **argv) {
         exit(1);
     }
     sk.configfile = toAbsPath(conffile, cwd);
+    if (prefix == NULL) {
+        prefix = strdup(cwd);
+    }
+    sk.prefix = prefix;
     return sk.configfile;
 }
 
@@ -849,7 +882,7 @@ static void initShuke() {
         sk.asyncReloadAllZone = &getAllZoneFromFile;
         sk.asyncReloadZone = &reloadZoneFromFile;
     } else {
-        LOG_EXIT(USER1, "invalid data store config %s", sk.data_store);
+        LOG_EXIT("invalid data store config %s", sk.data_store);
     }
 
     sk.rbroot = RB_ROOT;
@@ -863,24 +896,24 @@ static void initShuke() {
 
     long long reload_all_start = mstime();
     if (sk.syncGetAllZone() == ERR_CODE) {
-        LOG_EXIT(USER1, "can't load all zone data from %s", sk.data_store);
+        LOG_EXIT("can't load all zone data from %s", sk.data_store);
     }
     sk.zone_load_time = mstime() - reload_all_start;
-    LOG_INFO(USER1, "loading all zone from %s to memory cost %lld milliseconds.", sk.data_store, sk.zone_load_time);
+    LOG_INFO("loading all zone from %s to memory cost %lld milliseconds.", sk.data_store, sk.zone_load_time);
     sk.last_all_reload_ts = sk.unixtime;
 
     if (sk.initAsyncContext() == ERR_CODE) {
-        LOG_EXIT(USER1, "init %s async context error.", sk.data_store);
+        LOG_EXIT("init %s async context error.", sk.data_store);
     }
     // process task queue
     if (aeCreateTimeEvent(sk.el, TIME_INTERVAL, mainThreadCron, NULL, NULL) == AE_ERR) {
-        LOG_EXIT(USER1, "Can't create time event proc");
+        LOG_EXIT("Can't create time event proc");
     }
 
     // run admin server
-    LOG_INFO(USER1, "starting admin server on %s:%d", sk.admin_host, sk.admin_port);
+    LOG_INFO("starting admin server on %s:%d", sk.admin_host, sk.admin_port);
     if (initAdminServer() == ERR_CODE) {
-        LOG_EXIT(USER1, "can't init admin server.");
+        LOG_EXIT("can't init admin server.");
     }
 }
 
@@ -1125,7 +1158,7 @@ int initNumaConfig() {
         }
     }
     sk.nr_numa_id = n;
-    LOG_INFO(USER1, "lcore list: %s, numa: %d.", sk.total_lcore_list, sk.nr_numa_id);
+    LOG_INFO("lcore list: %s, numa: %d.", sk.total_lcore_list, sk.nr_numa_id);
     return 0;
 }
 
@@ -1230,9 +1263,7 @@ int main(int argc, char *argv[]) {
     if (argc >= 3 && !strcasecmp(argv[1], "test")) {
         initTestDpdkEal();
 
-        if (!strcasecmp(argv[2], "ds")) {
-            return dsTest(argc, argv);
-        } else if (!strcasecmp(argv[2], "zone_parser")) {
+        if (!strcasecmp(argv[2], "zparser")) {
             return zoneParserTest(argc, argv);
         }
         return -1;  /* test not found */
@@ -1271,11 +1302,11 @@ int main(int argc, char *argv[]) {
             if (is_all_veth_up()) break;
             else {
                 if (i == 20) {
-                    LOG_EXIT(USER1, "can't bring all kni virtual interfaces up.");
+                    LOG_EXIT("can't bring all kni virtual interfaces up.");
                 }
             }
         }
-        LOG_INFO(USER1, "starting dns tcp server.");
+        LOG_INFO("starting dns tcp server.");
         sk.tcp_srv = tcpServerCreate();
         assert(sk.tcp_srv);
     }
